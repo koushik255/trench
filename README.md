@@ -4,13 +4,19 @@ A small, self-hosted movie browser. Tissue scans a folder, serves the files over
 
 ## Run it
 
-The repository includes the built-in web UI, so running the server does not require Node.js:
+Set the movie folder in [`config.txt`](config.txt):
 
-```sh
-go run . -media /path/to/movies
+```txt
+path=/path/to/movies
 ```
 
-Then open <http://localhost:8080>. The server scans the media folder recursively. The default listen address is `127.0.0.1:8080`.
+Relative paths are resolved from the config file's folder. The repository includes the built-in web UI, so running the server does not require Node.js:
+
+```sh
+go run .
+```
+
+Then open <http://localhost:8080>. The server scans the configured folder recursively. The default listen address is `127.0.0.1:8080`. You can override the folder with `go run . -media /another/folder`.
 
 For access from other devices on your tailnet, keep the app on localhost and use Tailscale Serve as the HTTPS front door:
 

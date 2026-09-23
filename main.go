@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"embed"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -53,12 +55,27 @@ type server struct {
 }
 
 func main() {
-	mediaDir := flag.String("media", "./movies", "folder containing movie files")
+	configFile := flag.String("config", "config.txt", "configuration file")
+	mediaDir := flag.String("media", "", "folder containing movie files (overrides config.txt)")
 	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address (use 0.0.0.0 to listen on your LAN)")
 	ffmpeg := flag.String("ffmpeg", "ffmpeg", "FFmpeg executable used for compatibility transcoding")
 	flag.Parse()
 
-	root, err := filepath.Abs(*mediaDir)
+	configuredPath, err := readMediaPath(*configFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	mediaPathFromFlag := *mediaDir != ""
+	if mediaPathFromFlag {
+		configuredPath = *mediaDir
+	}
+	if configuredPath == "" {
+		configuredPath = "./movies"
+	}
+	if !filepath.IsAbs(configuredPath) && !mediaPathFromFlag {
+		configuredPath = filepath.Join(filepath.Dir(*configFile), configuredPath)
+	}
+	root, err := filepath.Abs(configuredPath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -82,6 +99,40 @@ func main() {
 
 	log.Printf("Serving %s at http://%s", root, *addr)
 	log.Fatal(http.ListenAndServe(*addr, logRequests(mux)))
+}
+
+func readMediaPath(configPath string) (string, error) {
+	file, err := os.Open(configPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("open config file %q: %w", configPath, err)
+	}
+	defer file.Close()
+
+	var path string
+	scanner := bufio.NewScanner(file)
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return "", fmt.Errorf("config file %q line %d: expected key=value", configPath, lineNumber)
+		}
+		if strings.TrimSpace(key) != "path" {
+			return "", fmt.Errorf("config file %q line %d: unknown setting %q", configPath, lineNumber, strings.TrimSpace(key))
+		}
+		path = strings.TrimSpace(value)
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read config file %q: %w", configPath, err)
+	}
+	return path, nil
 }
 
 func (s *server) library(w http.ResponseWriter, r *http.Request) {
