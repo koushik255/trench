@@ -1,0 +1,16 @@
+{
+  "name": "tissue-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b && vite build"
+  },
+  "dependencies": {
+    "mediabunny": "^1.42.0"
+  },
+  "devDependencies": {
+    "typescript": "~5.8.3",
+    "vite": "^6.3.5"
+  }
+}
