@@ -28,9 +28,11 @@ Open the HTTPS address printed by Tailscale on another tailnet device. HTTPS mat
 
 ## Compatibility mode
 
-Direct playback works when the browser can decode the movie's tracks. Select **Try compatibility mode** in the player to start a per-viewer FFmpeg process. It transcodes video to H.264 and audio to AAC, then writes an HLS playlist and segments in a temporary folder. Tissue serves those files to Mediabunny and deletes them when the player closes or the session expires.
+Direct playback works when the browser can decode the movie's tracks. If the video is compatible but the audio is not (for example, Opus or E-AC-3 in a browser without support), Tissue keeps video playback on the original file and starts a separate per-viewer FFmpeg audio session. FFmpeg converts audio to AAC as quickly as possible and publishes an audio-only HLS playlist progressively. The player waits for up to the first 30 seconds of audio, shows transcode progress separately from the movie timeline, and continues polling until the full track is ready.
 
-Install FFmpeg and make sure it is on `PATH` to use compatibility mode. Pass `-ffmpeg /path/to/ffmpeg` if it is installed somewhere else. Transcoding runs in real time and uses CPU while playing; it is optional for files that play directly.
+If the video itself is incompatible, select **Try compatibility mode** to start the full H.264/AAC HLS compatibility stream. Transcode sessions are stored in temporary directories and are removed when the player closes or the session expires.
+
+Install FFmpeg and make sure it is on `PATH` to use compatibility mode. Pass `-ffmpeg /path/to/ffmpeg` if it is installed somewhere else. Full compatibility transcoding runs in real time and uses CPU while playing. Audio-only compatibility transcoding runs ahead of playback and can finish well before the movie does.
 
 ## Build
 
@@ -50,6 +52,7 @@ go build -o tissue .
 
 - Scans common video files: AVI, M4V, MKV, MOV, MP4, MPEG, OGV, TS, WebM, and WMV.
 - Supports direct playback and manual FFmpeg HLS compatibility mode.
-- Compatibility mode uses the first video and audio tracks and does not yet provide subtitle or audio-track selection.
+- Import SRT/VTT subtitles during playback; subtitle cues are rendered into the video canvas and can be toggled and styled with the subtitle settings.
+- Compatibility mode uses the first video and audio tracks and does not yet provide embedded subtitle or audio-track selection.
 - Playback sessions are stored in temporary directories and automatically expire after two hours.
 # trench

@@ -1,2 +1,2 @@
 # Folder to scan for movies. Relative paths are resolved from this file's folder.
-path=./movies
+path= ~/Downloads

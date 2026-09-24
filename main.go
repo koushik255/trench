@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,17 +36,35 @@ var videoExtensions = map[string]bool{
 }
 
 type movie struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Path     string `json:"path"`
-	Size     int64  `json:"size"`
-	Modified string `json:"modified"`
+	ID       string  `json:"id"`
+	Name     string  `json:"name"`
+	Path     string  `json:"path"`
+	Size     int64   `json:"size"`
+	Modified string  `json:"modified"`
+	Duration float64 `json:"duration"`
+	IsMovie  bool    `json:"isMovie"`
+}
+
+type libraryResponse struct {
+	Movies []movie `json:"movies"`
+	Other  []movie `json:"other"`
+}
+
+type durationCacheEntry struct {
+	Size       int64   `json:"size"`
+	ModifiedNS int64   `json:"modifiedNs"`
+	Duration   float64 `json:"duration"`
+}
+
+type durationCacheFile struct {
+	Entries map[string]durationCacheEntry `json:"entries"`
 }
 
 type playbackSession struct {
-	dir    string
-	cancel context.CancelFunc
-	done   chan struct{}
+	dir      string
+	duration float64
+	cancel   context.CancelFunc
+	done     chan struct{}
 }
 
 type server struct {
@@ -52,6 +72,9 @@ type server struct {
 	ffmpeg    string
 	mu        sync.Mutex
 	sessions  map[string]*playbackSession
+	libraryMu sync.Mutex
+	cachePath string
+	durations map[string]durationCacheEntry
 }
 
 func main() {
@@ -72,6 +95,11 @@ func main() {
 	if configuredPath == "" {
 		configuredPath = "./movies"
 	}
+	if strings.HasPrefix(configuredPath, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			configuredPath = filepath.Join(home, strings.TrimPrefix(configuredPath, "~/"))
+		}
+	}
 	if !filepath.IsAbs(configuredPath) && !mediaPathFromFlag {
 		configuredPath = filepath.Join(filepath.Dir(*configFile), configuredPath)
 	}
@@ -84,11 +112,20 @@ func main() {
 		log.Fatalf("media folder %q does not exist or is not a directory", root)
 	}
 
-	app := &server{mediaRoot: root, ffmpeg: *ffmpeg, sessions: make(map[string]*playbackSession)}
+	cachePath := durationCachePath(root)
+	app := &server{
+		mediaRoot: root,
+		ffmpeg:    *ffmpeg,
+		sessions:  make(map[string]*playbackSession),
+		cachePath: cachePath,
+		durations: loadDurationCache(cachePath),
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/library", app.library)
+	mux.HandleFunc("GET /api/thumbnail/{id}", app.thumbnail)
 	mux.HandleFunc("GET /api/media/{id}", app.media)
 	mux.HandleFunc("POST /api/playback/{id}", app.startTranscode)
+	mux.HandleFunc("GET /api/playback/{session}/status", app.transcodeStatus)
 	mux.HandleFunc("GET /api/playback/{session}/{file...}", app.transcodeFile)
 	mux.HandleFunc("DELETE /api/playback/{session}", app.stopTranscode)
 	webRoot, err := fs.Sub(webFiles, "web/dist")
@@ -136,7 +173,13 @@ func readMediaPath(configPath string) (string, error) {
 }
 
 func (s *server) library(w http.ResponseWriter, r *http.Request) {
-	items := make([]movie, 0)
+	s.libraryMu.Lock()
+	defer s.libraryMu.Unlock()
+
+	movies := make([]movie, 0)
+	other := make([]movie, 0)
+	seen := make(map[string]bool)
+	dirty := false
 	err := filepath.WalkDir(s.mediaRoot, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -153,21 +196,120 @@ func (s *server) library(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		items = append(items, movie{
+		seen[rel] = true
+		cached, ok := s.durations[rel]
+		if !ok || cached.Size != info.Size() || cached.ModifiedNS != info.ModTime().UnixNano() {
+			cached = durationCacheEntry{
+				Size:       info.Size(),
+				ModifiedNS: info.ModTime().UnixNano(),
+				Duration:   probeDuration(path, s.ffmpeg),
+			}
+			s.durations[rel] = cached
+			dirty = true
+		}
+		item := movie{
 			ID:       base64.RawURLEncoding.EncodeToString([]byte(rel)),
 			Name:     strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())),
 			Path:     rel,
 			Size:     info.Size(),
 			Modified: info.ModTime().Format(time.RFC3339),
-		})
+			Duration: cached.Duration,
+			IsMovie:  cached.Duration >= 30*60,
+		}
+		if item.IsMovie {
+			movies = append(movies, item)
+		} else {
+			other = append(other, item)
+		}
 		return nil
 	})
 	if err != nil {
 		http.Error(w, "could not scan media folder", http.StatusInternalServerError)
 		return
 	}
-	sort.Slice(items, func(i, j int) bool { return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name) })
-	writeJSON(w, items)
+	for path := range s.durations {
+		if !seen[path] {
+			delete(s.durations, path)
+			dirty = true
+		}
+	}
+	if dirty {
+		saveDurationCache(s.cachePath, s.durations)
+	}
+	sort.Slice(movies, func(i, j int) bool { return strings.ToLower(movies[i].Name) < strings.ToLower(movies[j].Name) })
+	sort.Slice(other, func(i, j int) bool { return strings.ToLower(other[i].Name) < strings.ToLower(other[j].Name) })
+	writeJSON(w, libraryResponse{Movies: movies, Other: other})
+}
+
+func durationCachePath(mediaRoot string) string {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		return filepath.Join(mediaRoot, ".tissue-duration-cache.json")
+	}
+	hash := sha256.Sum256([]byte(mediaRoot))
+	return filepath.Join(cacheDir, "tissue", fmt.Sprintf("%x.json", hash[:8]))
+}
+
+func loadDurationCache(path string) map[string]durationCacheEntry {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return make(map[string]durationCacheEntry)
+	}
+	var cache durationCacheFile
+	if err := json.Unmarshal(data, &cache); err != nil || cache.Entries == nil {
+		log.Printf("ignoring invalid duration cache %q", path)
+		return make(map[string]durationCacheEntry)
+	}
+	return cache.Entries
+}
+
+func saveDurationCache(path string, entries map[string]durationCacheEntry) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		log.Printf("could not create duration cache directory: %v", err)
+		return
+	}
+	data, err := json.MarshalIndent(durationCacheFile{Entries: entries}, "", "  ")
+	if err != nil {
+		log.Printf("could not encode duration cache: %v", err)
+		return
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), ".tissue-duration-cache-*.tmp")
+	if err != nil {
+		log.Printf("could not create duration cache: %v", err)
+		return
+	}
+	tempName := temp.Name()
+	defer func() {
+		_ = temp.Close()
+		_ = os.Remove(tempName)
+	}()
+	if _, err := temp.Write(data); err != nil {
+		log.Printf("could not write duration cache: %v", err)
+		return
+	}
+	if err := temp.Close(); err != nil {
+		log.Printf("could not close duration cache: %v", err)
+		return
+	}
+	if err := os.Rename(tempName, path); err != nil {
+		log.Printf("could not save duration cache: %v", err)
+	}
+}
+
+func probeDuration(path, ffprobe string) float64 {
+	probe := ffprobe
+	if probe == "ffmpeg" {
+		probe = "ffprobe"
+	}
+	output, err := exec.Command(probe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path).Output()
+	if err != nil {
+		return 0
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(string(output)), 64)
+	if err != nil || duration < 0 {
+		return 0
+	}
+	return duration
 }
 
 func (s *server) resolveMovie(id string) (string, error) {
@@ -203,9 +345,80 @@ func (s *server) media(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 
+func (s *server) thumbnail(w http.ResponseWriter, r *http.Request) {
+	path, err := s.resolveMovie(r.PathValue("id"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	cachePath := thumbnailCachePath(s.mediaRoot, path, info)
+	thumbnailMu.Lock()
+	defer thumbnailMu.Unlock()
+	if _, err := os.Stat(cachePath); err != nil {
+		if err := createThumbnail(s.ffmpeg, path, cachePath); err != nil {
+			log.Printf("could not create thumbnail for %q: %v", path, err)
+			http.Error(w, "could not create thumbnail", http.StatusInternalServerError)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	http.ServeFile(w, r, cachePath)
+}
+
+var thumbnailMu sync.Mutex
+
+func thumbnailCachePath(mediaRoot, mediaPath string, info os.FileInfo) string {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		cacheDir = filepath.Dir(mediaRoot)
+	}
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", mediaPath, info.Size(), info.ModTime().UnixNano())))
+	return filepath.Join(cacheDir, "tissue", "thumbnails", fmt.Sprintf("%x.jpg", hash[:]))
+}
+
+func createThumbnail(ffmpeg, mediaPath, cachePath string) error {
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(cachePath), ".tissue-thumbnail-*.jpg")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempName)
+		return err
+	}
+	defer os.Remove(tempName)
+
+	baseArgs := []string{
+		"-hide_banner", "-loglevel", "error", "-ss", "5", "-i", mediaPath,
+		"-frames:v", "1", "-vf", "scale='min(640,iw)':-2", "-q:v", "4", "-y", tempName,
+	}
+	if output, err := exec.Command(ffmpeg, baseArgs...).CombinedOutput(); err != nil {
+		// Very short videos may not have a frame five seconds in. Retry from the beginning.
+		startArgs := []string{
+			"-hide_banner", "-loglevel", "error", "-i", mediaPath,
+			"-frames:v", "1", "-vf", "scale='min(640,iw)':-2", "-q:v", "4", "-y", tempName,
+		}
+		if output, err = exec.Command(ffmpeg, startArgs...).CombinedOutput(); err != nil {
+			return fmt.Errorf("ffmpeg: %w (%s)", err, strings.TrimSpace(string(output)))
+		}
+	}
+	return os.Rename(tempName, cachePath)
+}
+
 type playbackResponse struct {
-	Session string `json:"session"`
-	URL     string `json:"url"`
+	Session   string  `json:"session"`
+	URL       string  `json:"url"`
+	AudioOnly bool    `json:"audioOnly"`
+	Duration  float64 `json:"duration"`
 }
 
 func (s *server) startTranscode(w http.ResponseWriter, r *http.Request) {
@@ -231,15 +444,25 @@ func (s *server) startTranscode(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(context.Background())
 	playlistPath := filepath.Join(dir, "index.m3u8")
 	segmentPattern := filepath.Join(dir, "segment_%05d.ts")
-	args := []string{
-		"-hide_banner", "-loglevel", "error", "-nostdin", "-re", "-i", path,
-		"-map", "0:v:0?", "-map", "0:a:0?", "-sn", "-dn",
-		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+	audioOnly := r.URL.Query().Get("audioOnly") == "1"
+	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin"}
+	if !audioOnly {
+		args = append(args, "-re")
+	}
+	args = append(args, "-i", path, "-map", "0:v:0?", "-map", "0:a:0?", "-sn", "-dn")
+	if audioOnly {
+		// The browser keeps decoding video from the original file. This session is
+		// only a fast, progressive AAC rendition of the audio track.
+		args = append(args, "-vn")
+	} else {
+		args = append(args, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p")
+	}
+	args = append(args,
 		"-c:a", "aac", "-b:a", "160k", "-ac", "2",
 		"-force_key_frames", "expr:gte(t,n_forced*4)",
 		"-f", "hls", "-hls_time", "4", "-hls_list_size", "0", "-hls_playlist_type", "event",
 		"-hls_flags", "independent_segments", "-hls_segment_filename", segmentPattern, playlistPath,
-	}
+	)
 	cmd := exec.CommandContext(ctx, s.ffmpeg, args...)
 	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
@@ -248,7 +471,7 @@ func (s *server) startTranscode(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not start FFmpeg", http.StatusInternalServerError)
 		return
 	}
-	session := &playbackSession{dir: dir, cancel: cancel, done: make(chan struct{})}
+	session := &playbackSession{dir: dir, duration: probeDuration(path, s.ffmpeg), cancel: cancel, done: make(chan struct{})}
 	s.mu.Lock()
 	s.sessions[id] = session
 	s.mu.Unlock()
@@ -262,7 +485,7 @@ func (s *server) startTranscode(w http.ResponseWriter, r *http.Request) {
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(playlistPath); err == nil {
-			writeJSON(w, playbackResponse{Session: id, URL: "/api/playback/" + id + "/index.m3u8"})
+			writeJSON(w, playbackResponse{Session: id, URL: "/api/playback/" + id + "/index.m3u8", AudioOnly: audioOnly, Duration: probeDuration(path, s.ffmpeg)})
 			return
 		}
 		select {
@@ -281,6 +504,39 @@ func (s *server) startTranscode(w http.ResponseWriter, r *http.Request) {
 	}
 	s.removeSession(id)
 	http.Error(w, "timed out waiting for FFmpeg to start", http.StatusGatewayTimeout)
+}
+
+type transcodeStatusResponse struct {
+	ReadyDuration float64 `json:"readyDuration"`
+	Duration      float64 `json:"duration"`
+	Complete      bool    `json:"complete"`
+}
+
+func (s *server) transcodeStatus(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("session")
+	s.mu.Lock()
+	session := s.sessions[id]
+	s.mu.Unlock()
+	if session == nil {
+		http.NotFound(w, r)
+		return
+	}
+	playlist, err := os.ReadFile(filepath.Join(session.dir, "index.m3u8"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ready := 0.0
+	for _, line := range strings.Split(string(playlist), "\n") {
+		if strings.HasPrefix(line, "#EXTINF:") {
+			value := strings.TrimSuffix(strings.TrimPrefix(line, "#EXTINF:"), ",")
+			if seconds, err := strconv.ParseFloat(value, 64); err == nil {
+				ready += seconds
+			}
+		}
+	}
+	complete := strings.Contains(string(playlist), "#EXT-X-ENDLIST")
+	writeJSON(w, transcodeStatusResponse{ReadyDuration: ready, Duration: session.duration, Complete: complete})
 }
 
 func (s *server) transcodeFile(w http.ResponseWriter, r *http.Request) {
